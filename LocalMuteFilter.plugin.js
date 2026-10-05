@@ -1,382 +1,253 @@
 /**
  * @name LocalMuteFilter
  * @author LayTsyn
- * @description Locally mutes everyone in a voice channel except users in the whitelist
- * @version 2.0.0
+ * @version 1.0.0
+ * @description Locally mutes everyone in a voice channel except whitelisted users
  */
 
-const USER_ID_REGEX = /^\d{17,20}$/; // Discord snowflake: 17–20 digits
-const STYLE_ID = "lmf-styles-v1";
-const DEBOUNCE_SETTINGS_MS = 400;
-const DEBOUNCE_SYNC_MS = 100;
+const ID_RE = /^\d{17,20}$/;
+const STYLE_ID = "lmf-style";
 const DATA_KEY = "whitelist";
-
-const CSS = `
-    .lmf-panel { display: flex; flex-direction: column; gap: 8px; }
-    .lmf-label { font-weight: bold; }
-    .lmf-hint { font-size: 11px; opacity: 0.7; }
-    .lmf-input {
-        width: 100%; height: 120px; padding: 8px;
-        border-radius: 4px;
-        background: var(--background-secondary);
-        color: var(--text-normal);
-        border: 1px solid var(--background-tertiary);
-        font-family: monospace; font-size: 12px;
-        resize: vertical;
-    }
-    .lmf-status { font-size: 11px; opacity: 0.8; }
-`;
 
 module.exports = class LocalMuteFilter {
     constructor() {
         this.api = new BdApi("LocalMuteFilter");
 
-        try {
-            const raw = this.api.Data.load(DATA_KEY) ?? [];
-            this.whitelist = Array.isArray(raw)
-                ? raw.filter(x => typeof x === "string" && USER_ID_REGEX.test(x))
-                : [];
-        } catch {
-            this.whitelist = [];
-        }
-        this.whitelistSet = new Set(this.whitelist);
+        let raw = [];
+        try { raw = this.api.Data.load(DATA_KEY) || []; } catch (e) {}
+        this.wl = Array.isArray(raw) ? raw.filter(x => typeof x === "string" && ID_RE.test(x)) : [];
+        this.wlSet = new Set(this.wl);
 
-        this._listening = false;
-        this._syncTimer = null;
-        this._settingsRaf = null;
-        this._settingsTimer = null;
-        this._commitWhitelistFn = null;
+        this.listening = false;
+        this.syncTimer = null;
+        this.rafId = null;
+        this.settingsTimer = null;
+        this.commitFn = null;
+        this.chan = null;
+        this.muted = new Set();
 
-        this._currentChannelId = null;
-        this._mutedInChannel = new Set();
-
-        this.mediaStore = null;
+        this.media = null;
         this.actions = null;
-        this.VoiceStateStore = null;
-        this.UserStore = null;
+        this.voice = null;
+        this.users = null;
 
-        this.boundHandler = this.handleVoiceUpdate.bind(this);
+        this.onUpdate = this.handleUpdate.bind(this);
     }
 
-    // === LIFECYCLE ===
-
-    /**
-     * Plugin startup: cache modules, subscribe, initial sync.
-     */
     start() {
         this.api.Logger.info("Starting...");
 
-        // Reset possible stale state from a previous session
-        this._currentChannelId = null;
-        this._mutedInChannel.clear();
+        this.chan = null;
+        this.muted.clear();
 
-        const Webpack = this.api.Webpack ?? BdApi.Webpack;
-        const findStore = (name) => Webpack.getModule(m => m?.getName?.() === name);
-        this.mediaStore = findStore("MediaEngineStore");
-        this.VoiceStateStore = findStore("VoiceStateStore");
-        this.UserStore = findStore("UserStore");
+        let wp = this.api.Webpack || BdApi.Webpack;
+        let get = (n) => wp.getModule(m => m?.getName?.() === n);
+        this.media = get("MediaEngineStore");
+        this.voice = get("VoiceStateStore");
+        this.users = get("UserStore");
 
-        const actionsModule = Webpack.getByKeys(["toggleLocalMute"]);
-        this.actions = actionsModule && typeof actionsModule.toggleLocalMute === "function"
-            ? actionsModule
-            : null;
+        let am = wp.getByKeys(["toggleLocalMute"]);
+        this.actions = am && typeof am.toggleLocalMute === "function" ? am : null;
 
-        if (!this.mediaStore || !this.actions || !this.VoiceStateStore || !this.UserStore) {
-            this.api.UI.showToast(
-                "Required Discord modules were not found. Plugin not started.",
-                { type: "error", timeout: 10000 }
-            );
+        if (!this.media || !this.actions || !this.voice || !this.users) {
+            this.api.UI.showToast("Required Discord modules not found. Plugin not started.", { type: "error", timeout: 10000 });
             this.api.Logger.error("Modules not found", {
-                mediaStore: !!this.mediaStore,
+                media: !!this.media,
                 actions: !!this.actions,
-                VoiceStateStore: !!this.VoiceStateStore,
-                UserStore: !!this.UserStore,
+                voice: !!this.voice,
+                users: !!this.users
             });
             return;
         }
 
-        if (!this._listening) {
-            this.VoiceStateStore.addChangeListener(this.boundHandler);
-            this._listening = true;
+        if (!this.listening) {
+            this.voice.addChangeListener(this.onUpdate);
+            this.listening = true;
         }
 
         this.injectStyles();
-
-        this._currentChannelId = this.getCurrentChannelId();
-        this.syncChannelMutes();
+        this.chan = this.getChannelId();
+        this.sync();
 
         this.api.Logger.info("Active");
     }
 
-    /**
-     * Plugin shutdown: flush unsaved settings, clear mutes, unsubscribe.
-     */
     stop() {
         this.api.Logger.info("Stopping...");
 
-        // Flush unsaved settings
-        if (this._commitWhitelistFn) {
-            try { this._commitWhitelistFn(); } catch (e) {
-                this.api.Logger.error("Failed to flush settings", e);
-            }
-            this._commitWhitelistFn = null;
+        if (this.commitFn) {
+            try { this.commitFn(); } catch (e) { this.api.Logger.error("Flush failed", e); }
+            this.commitFn = null;
         }
 
-        const removed = this.clearChannelMutes();
-        this.api.Logger.info(`Cleared mutes: ${removed}`);
+        let n = this.clearMutes();
+        this.api.Logger.info("Cleared mutes: " + n);
 
-        if (this._listening && this.VoiceStateStore) {
-            this.VoiceStateStore.removeChangeListener(this.boundHandler);
-            this._listening = false;
+        if (this.listening && this.voice) {
+            this.voice.removeChangeListener(this.onUpdate);
+            this.listening = false;
         }
 
-        if (this._syncTimer) {
-            clearTimeout(this._syncTimer);
-            this._syncTimer = null;
-        }
+        if (this.syncTimer) { clearTimeout(this.syncTimer); this.syncTimer = null; }
+        if (this.settingsTimer) { clearTimeout(this.settingsTimer); this.settingsTimer = null; }
+        if (this.rafId) { cancelAnimationFrame(this.rafId); this.rafId = null; }
 
-        if (this._settingsTimer) {
-            clearTimeout(this._settingsTimer);
-            this._settingsTimer = null;
-        }
-
-        if (this._settingsRaf) {
-            cancelAnimationFrame(this._settingsRaf);
-            this._settingsRaf = null;
-        }
-
-        const style = document.getElementById(STYLE_ID);
+        let style = document.getElementById(STYLE_ID);
         if (style) style.remove();
 
-        this._currentChannelId = null;
-
+        this.chan = null;
         this.api.Logger.info("Stopped");
     }
 
-    // === SETTINGS PANEL ===
-
-    /**
-     * Returns an HTMLElement with plugin settings.
-     * Saving and applying is debounced.
-     * Unsaved changes are flushed immediately when the panel is closed.
-     * @returns {HTMLElement}
-     */
     getSettingsPanel() {
-        // Clean up previous resources if the panel is opened again
-        if (this._settingsTimer) {
-            clearTimeout(this._settingsTimer);
-            this._settingsTimer = null;
-        }
-        if (this._settingsRaf) {
-            cancelAnimationFrame(this._settingsRaf);
-            this._settingsRaf = null;
-        }
+        if (this.settingsTimer) { clearTimeout(this.settingsTimer); this.settingsTimer = null; }
+        if (this.rafId) { cancelAnimationFrame(this.rafId); this.rafId = null; }
 
-        const panel = document.createElement("div");
-        panel.className = "lmf-panel";
+        let panel = document.createElement("div");
+        panel.style.cssText = "display:flex;flex-direction:column;gap:8px";
 
-        const label = document.createElement("div");
-        label.className = "lmf-label";
+        let label = document.createElement("div");
+        label.style.fontWeight = "bold";
         label.textContent = "User IDs (comma or newline separated)";
 
-        const hint = document.createElement("div");
-        hint.className = "lmf-hint";
-        hint.textContent = "Digits only, 17–20 characters. Invalid values are ignored.";
+        let hint = document.createElement("div");
+        hint.style.cssText = "font-size:11px;opacity:0.7";
+        hint.textContent = "Digits only, 17-20 characters. Invalid values are ignored.";
 
-        const input = document.createElement("textarea");
-        input.className = "lmf-input";
-        input.value = this.whitelist.join("\n");
+        let input = document.createElement("textarea");
+        input.style.cssText = "width:100%;height:120px;padding:8px;border-radius:4px;background:var(--background-secondary);color:var(--text-normal);border:1px solid var(--background-tertiary);font-family:monospace;font-size:12px;resize:vertical";
+        input.value = this.wl.join("\n");
         input.placeholder = "123456789012345678\n987654321098765432";
 
-        const status = document.createElement("div");
-        status.className = "lmf-status";
-        status.textContent = `Saved: ${this.whitelist.length}`;
+        let status = document.createElement("div");
+        status.style.cssText = "font-size:11px;opacity:0.8";
+        status.textContent = "Saved: " + this.wl.length;
 
-        /**
-         * Applies the input value to the whitelist and persists it.
-         */
-        const commitWhitelist = () => {
-            const raw = input.value;
-            const all = raw.split(/[\n,]+/).map(s => s.trim()).filter(Boolean);
-            const valid = [...new Set(all.filter(s => USER_ID_REGEX.test(s)))];
-            const dropped = all.length - valid.length;
+        let commit = () => {
+            let raw = input.value;
+            let all = raw.split(/[\n,]+/).map(s => s.trim()).filter(Boolean);
+            let valid = [...new Set(all.filter(s => ID_RE.test(s)))];
+            let dropped = all.length - valid.length;
 
-            this.whitelist = valid;
-            this.whitelistSet = new Set(valid);
+            this.wl = valid;
+            this.wlSet = new Set(valid);
             this.api.Data.save(DATA_KEY, valid);
 
-            status.textContent = dropped > 0
-                ? `Saved: ${valid.length} (discarded: ${dropped})`
-                : `Saved: ${valid.length}`;
+            status.textContent = dropped > 0 ? "Saved: " + valid.length + " (discarded: " + dropped + ")" : "Saved: " + valid.length;
 
-            this.syncChannelMutes();
+            this.sync();
         };
 
-        // Store a reference for flushing on stop()
-        this._commitWhitelistFn = commitWhitelist;
+        this.commitFn = commit;
 
         input.addEventListener("input", () => {
-            if (this._settingsTimer) clearTimeout(this._settingsTimer);
-            this._settingsTimer = setTimeout(() => {
-                this._settingsTimer = null;
-                commitWhitelist();
-            }, DEBOUNCE_SETTINGS_MS);
+            if (this.settingsTimer) clearTimeout(this.settingsTimer);
+            this.settingsTimer = setTimeout(() => { this.settingsTimer = null; commit(); }, 400);
         });
 
-        // Check once per frame whether the panel is still alive; flush on detach.
-        // requestAnimationFrame is cheaper than a MutationObserver on document.body.
-        const checkAlive = () => {
+        // flush on panel close
+        let checkAlive = () => {
             if (!panel.isConnected) {
-                if (this._settingsTimer) {
-                    clearTimeout(this._settingsTimer);
-                    this._settingsTimer = null;
-                    commitWhitelist();
-                }
-                this._settingsRaf = null;
-                this._commitWhitelistFn = null;
+                if (this.settingsTimer) { clearTimeout(this.settingsTimer); this.settingsTimer = null; commit(); }
+                this.rafId = null;
+                this.commitFn = null;
                 return;
             }
-            this._settingsRaf = requestAnimationFrame(checkAlive);
+            this.rafId = requestAnimationFrame(checkAlive);
         };
-        this._settingsRaf = requestAnimationFrame(checkAlive);
+        this.rafId = requestAnimationFrame(checkAlive);
 
         panel.append(label, hint, input, status);
         return panel;
     }
 
-    /**
-     * Injects the plugin CSS into head. Idempotent.
-     */
     injectStyles() {
-        const existing = document.getElementById(STYLE_ID);
+        let existing = document.getElementById(STYLE_ID);
         if (existing) existing.remove();
-
-        const style = document.createElement("style");
+        let style = document.createElement("style");
         style.id = STYLE_ID;
-        style.textContent = CSS;
+        style.textContent = ".lmf-panel{display:flex;flex-direction:column;gap:8px}";
         document.head.appendChild(style);
     }
 
-    // === CORE LOGIC ===
-
-    /**
-     * Removes local mutes from every user the plugin muted in the current
-     * channel, and clears the internal set.
-     * @returns {number} number of mutes actually removed
-     */
-    clearChannelMutes() {
-        if (!this.mediaStore || !this.actions) {
-            const had = this._mutedInChannel.size;
-            this._mutedInChannel.clear();
-            return had;
+    clearMutes() {
+        if (!this.media || !this.actions) {
+            let n = this.muted.size;
+            this.muted.clear();
+            return n;
         }
-
         let removed = 0;
-        for (const userId of Array.from(this._mutedInChannel)) {
+        for (let id of Array.from(this.muted)) {
             try {
-                if (this.mediaStore.isLocalMute(userId)) {
-                    this.actions.toggleLocalMute(userId);
+                if (this.media.isLocalMute(id)) {
+                    this.actions.toggleLocalMute(id);
                     removed++;
                 }
-            } catch (e) {
-                this.api.Logger.error(`Failed to unmute ${userId}`, e);
-            }
+            } catch (e) { this.api.Logger.error("Failed to unmute " + id, e); }
         }
-        this._mutedInChannel.clear();
+        this.muted.clear();
         return removed;
     }
 
-    /**
-     * Brings the mute state of the current channel in line with the whitelist.
-     * Works both for guild voice channels and DM calls.
-     */
-    syncChannelMutes() {
-        if (!this.VoiceStateStore || !this.UserStore || !this.mediaStore || !this.actions) return;
+    sync() {
+        if (!this.voice || !this.users || !this.media || !this.actions) return;
 
-        const channelId = this.getCurrentChannelId();
-        if (!channelId) return;
+        let chanId = this.getChannelId();
+        if (!chanId) return;
 
-        const voiceStates = this.VoiceStateStore.getVoiceStatesForChannel(channelId);
-        if (!voiceStates) return;
+        let states = this.voice.getVoiceStatesForChannel(chanId);
+        if (!states) return;
 
-        const myId = this.UserStore.getCurrentUser()?.id;
+        let me = this.users.getCurrentUser()?.id;
 
-        for (const state of Object.values(voiceStates)) {
-            const userId = state?.userId;
-            if (!userId || userId === myId) continue;
-            if (state.channelId && state.channelId !== channelId) continue;
+        for (let s of Object.values(states)) {
+            let id = s?.userId;
+            if (!id || id === me) continue;
+            if (s.channelId && s.channelId !== chanId) continue;
 
-            const inWhitelist = this.whitelistSet.has(userId);
+            let inWl = this.wlSet.has(id);
 
-            if (inWhitelist) {
-                if (this._mutedInChannel.has(userId)) {
-                    this.setMute(userId, false);
-                    this._mutedInChannel.delete(userId);
+            if (inWl) {
+                if (this.muted.has(id)) {
+                    this.setMute(id, false);
+                    this.muted.delete(id);
                 }
             } else {
-                if (!this._mutedInChannel.has(userId)) {
-                    this.setMute(userId, true);
-                    // "Adopt" the mute even if it wasn't ours — the plugin owns the channel
-                    if (this.mediaStore.isLocalMute(userId)) {
-                        this._mutedInChannel.add(userId);
-                    }
+                if (!this.muted.has(id)) {
+                    this.setMute(id, true);
+                    if (this.media.isLocalMute(id)) this.muted.add(id);
                 }
             }
         }
     }
 
-    /**
-     * Reacts to voice state store changes with a debounce.
-     * Tracks channel switches: on leave — clears mutes,
-     * on join — applies the rule to the new channel.
-     */
-    handleVoiceUpdate() {
-        if (this._syncTimer) return;
-        this._syncTimer = setTimeout(() => {
-            this._syncTimer = null;
+    handleUpdate() {
+        if (this.syncTimer) return;
+        this.syncTimer = setTimeout(() => {
+            this.syncTimer = null;
             try {
-                const newChannelId = this.getCurrentChannelId();
-
-                if (newChannelId !== this._currentChannelId) {
-                    this.api.Logger.info(`Channel changed: ${this._currentChannelId} → ${newChannelId}`);
-                    this.clearChannelMutes();
-                    this._currentChannelId = newChannelId;
+                let newChan = this.getChannelId();
+                if (newChan !== this.chan) {
+                    this.api.Logger.info("Channel changed: " + this.chan + " -> " + newChan);
+                    this.clearMutes();
+                    this.chan = newChan;
                 }
-
-                if (newChannelId) {
-                    this.syncChannelMutes();
-                }
-            } catch (e) {
-                this.api.Logger.error("Error in handleVoiceUpdate", e);
-            }
-        }, DEBOUNCE_SYNC_MS);
+                if (newChan) this.sync();
+            } catch (e) { this.api.Logger.error("handleUpdate error", e); }
+        }, 100);
     }
 
-    /**
-     * Sets or clears a local mute. The single point of state checking.
-     * @param {string} userId
-     * @param {boolean} shouldMute
-     */
-    setMute(userId, shouldMute) {
+    setMute(id, mute) {
         try {
-            const currentlyMuted = this.mediaStore.isLocalMute(userId);
-            if (currentlyMuted !== shouldMute) {
-                this.actions.toggleLocalMute(userId);
-            }
-        } catch (e) {
-            this.api.Logger.error(`setMute failed for ${userId}`, e);
-        }
+            let now = this.media.isLocalMute(id);
+            if (now !== mute) this.actions.toggleLocalMute(id);
+        } catch (e) { this.api.Logger.error("setMute failed for " + id, e); }
     }
 
-    /**
-     * ID of the voice channel the current user is in.
-     * @returns {string|null}
-     */
-    getCurrentChannelId() {
-        const myId = this.UserStore?.getCurrentUser?.()?.id;
-        if (!myId) return null;
-
-        const voiceState = this.VoiceStateStore?.getVoiceStateForUser?.(myId);
-        return voiceState ? voiceState.channelId : null;
+    getChannelId() {
+        let me = this.users?.getCurrentUser?.()?.id;
+        if (!me) return null;
+        let vs = this.voice?.getVoiceStateForUser?.(me);
+        return vs ? vs.channelId : null;
     }
 };

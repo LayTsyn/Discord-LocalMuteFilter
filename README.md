@@ -40,9 +40,9 @@ This makes the plugin safe to use anywhere: in servers, in DMs, in group calls. 
 
 The whitelist is the **single source of truth**:
 
-- If a user is in the whitelist, the plugin guarantees they are *not* locally muted by it — even if they were muted before the plugin started.
-- If a user is not in the whitelist, the plugin guarantees they *are* locally muted — even if they were unmuted before.
-- When you leave the channel, the plugin removes every mute it set (including mutes it "adopted" from your manual actions while the plugin was active).
+- If a user is in the whitelist, the plugin guarantees they are *not* locally muted by it.
+- If a user is not in the whitelist, the plugin guarantees they *are* locally muted.
+- When you leave the channel, the plugin removes every mute it set.
 
 ## Configuration
 

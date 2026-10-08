@@ -2,7 +2,7 @@
  * @name LocalMuteFilter
  * @author LayTsyn
  * @description Locally mutes everyone in a voice channel except whitelisted users
- * @version 1.0.0
+ * @version 1.0.1
  */
 
 const STORAGE_KEY = "whitelist";
@@ -77,6 +77,19 @@ module.exports = class LocalMuteFilter {
         });
 
         panel.append(label, input, status);
+
+        const captureFocus = (e) => {
+            if (panel.contains(e.target)) e.stopPropagation();
+        };
+        window.addEventListener("focus", captureFocus, true);
+        window.addEventListener("focusin", captureFocus, true);
+
+        setTimeout(() => {
+            input.focus();
+            input.selectionStart = input.value.length;
+            input.selectionEnd = input.value.length;
+        }, 50);
+
         return panel;
     }
 

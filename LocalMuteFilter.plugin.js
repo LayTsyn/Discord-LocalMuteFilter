@@ -2,7 +2,7 @@
  * @name LocalMuteFilter
  * @author LayTsyn
  * @description Locally mutes everyone in a voice channel except whitelisted users
- * @version 1.0.1
+ * @version 1.0.2
  */
 
 const STORAGE_KEY = "whitelist";
@@ -17,7 +17,6 @@ module.exports = class LocalMuteFilter {
 
         this.muted = new Set(); // users muted by the plugin, only these are ever unmuted by it
         this.running = false;
-        this.onVoiceChange = () => this.sync();
     }
 
     start() {
@@ -31,14 +30,14 @@ module.exports = class LocalMuteFilter {
             throw new Error("Required Discord modules were not found");
         }
 
-        this.voice.addChangeListener(this.onVoiceChange);
+        this.voice.addChangeListener(this.sync);
         this.running = true;
         this.sync();
     }
 
     stop() {
         this.running = false;
-        this.voice?.removeChangeListener(this.onVoiceChange);
+        this.voice?.removeChangeListener(this.sync);
 
         for (const id of this.muted) this.unmute(id);
         this.muted.clear();
@@ -78,6 +77,10 @@ module.exports = class LocalMuteFilter {
 
         panel.append(label, input, status);
 
+        // Prevent Discord's focus-layers from stealing focus away from our textarea.
+        // Discord listens for focus/focusin on `document` in the capture phase.
+        // We listen on `window` (which is above `document`) also in capture,
+        // so our handler fires first and can stop propagation.
         const captureFocus = (e) => {
             if (panel.contains(e.target)) e.stopPropagation();
         };
